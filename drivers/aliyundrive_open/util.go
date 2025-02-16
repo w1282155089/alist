@@ -1,53 +1,109 @@
 package aliyundrive_open
 
 import (
+	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 // do others that not defined in Driver interface
 
-func (d *AliyundriveOpen) refreshToken() error {
-	url := d.base + "/oauth/access_token"
+func (d *AliyundriveOpen) _refreshToken() (string, string, error) {
+	url := API_URL + "/oauth/access_token"
 	if d.OauthTokenURL != "" && d.ClientID == "" {
 		url = d.OauthTokenURL
 	}
-	var resp base.TokenResp
+	//var resp base.TokenResp
 	var e ErrResp
-	_, err := base.RestyClient.R().
-		ForceContentType("application/json").
+	res, err := base.RestyClient.R().
+		//ForceContentType("application/json").
 		SetBody(base.Json{
 			"client_id":     d.ClientID,
 			"client_secret": d.ClientSecret,
 			"grant_type":    "refresh_token",
 			"refresh_token": d.RefreshToken,
 		}).
-		SetResult(&resp).
+		//SetResult(&resp).
 		SetError(&e).
 		Post(url)
 	if err != nil {
+		return "", "", err
+	}
+	log.Debugf("[ali_open] refresh token response: %s", res.String())
+	if e.Code != "" {
+		return "", "", fmt.Errorf("failed to refresh token: %s", e.Message)
+	}
+	refresh, access := utils.Json.Get(res.Body(), "refresh_token").ToString(), utils.Json.Get(res.Body(), "access_token").ToString()
+	if refresh == "" {
+		return "", "", fmt.Errorf("failed to refresh token: refresh token is empty, resp: %s", res.String())
+	}
+	curSub, err := getSub(d.RefreshToken)
+	if err != nil {
+		return "", "", err
+	}
+	newSub, err := getSub(refresh)
+	if err != nil {
+		return "", "", err
+	}
+	if curSub != newSub {
+		return "", "", errors.New("failed to refresh token: sub not match")
+	}
+	return refresh, access, nil
+}
+
+func getSub(token string) (string, error) {
+	segments := strings.Split(token, ".")
+	if len(segments) != 3 {
+		return "", errors.New("not a jwt token because of invalid segments")
+	}
+	bs, err := base64.RawStdEncoding.DecodeString(segments[1])
+	if err != nil {
+		return "", errors.New("failed to decode jwt token")
+	}
+	return utils.Json.Get(bs, "sub").ToString(), nil
+}
+
+func (d *AliyundriveOpen) refreshToken() error {
+	if d.ref != nil {
+		return d.ref.refreshToken()
+	}
+	refresh, access, err := d._refreshToken()
+	for i := 0; i < 3; i++ {
+		if err == nil {
+			break
+		} else {
+			log.Errorf("[ali_open] failed to refresh token: %s", err)
+		}
+		refresh, access, err = d._refreshToken()
+	}
+	if err != nil {
 		return err
 	}
-	if e.Code != "" {
-		return fmt.Errorf("failed to refresh token: %s", e.Message)
-	}
-	if resp.RefreshToken == "" {
-		return errors.New("failed to refresh token: refresh token is empty")
-	}
-	d.RefreshToken, d.AccessToken = resp.RefreshToken, resp.AccessToken
+	log.Infof("[ali_open] token exchange: %s -> %s", d.RefreshToken, refresh)
+	d.RefreshToken, d.AccessToken = refresh, access
 	op.MustSaveDriverStorage(d)
 	return nil
 }
 
 func (d *AliyundriveOpen) request(uri, method string, callback base.ReqCallback, retry ...bool) ([]byte, error) {
+	b, err, _ := d.requestReturnErrResp(uri, method, callback, retry...)
+	return b, err
+}
+
+func (d *AliyundriveOpen) requestReturnErrResp(uri, method string, callback base.ReqCallback, retry ...bool) ([]byte, error, *ErrResp) {
 	req := base.RestyClient.R()
 	// TODO check whether access_token is expired
-	req.SetHeader("Authorization", "Bearer "+d.AccessToken)
+	req.SetHeader("Authorization", "Bearer "+d.getAccessToken())
 	if method == http.MethodPost {
 		req.SetHeader("Content-Type", "application/json")
 	}
@@ -56,32 +112,45 @@ func (d *AliyundriveOpen) request(uri, method string, callback base.ReqCallback,
 	}
 	var e ErrResp
 	req.SetError(&e)
-	res, err := req.Execute(method, d.base+uri)
+	res, err := req.Execute(method, API_URL+uri)
 	if err != nil {
-		return nil, err
+		if res != nil {
+			log.Errorf("[aliyundrive_open] request error: %s", res.String())
+		}
+		return nil, err, nil
 	}
 	isRetry := len(retry) > 0 && retry[0]
 	if e.Code != "" {
-		if !isRetry && e.Code == "AccessTokenInvalid" {
+		if !isRetry && (utils.SliceContains([]string{"AccessTokenInvalid", "AccessTokenExpired", "I400JD"}, e.Code) || d.getAccessToken() == "") {
 			err = d.refreshToken()
 			if err != nil {
-				return nil, err
+				return nil, err, nil
 			}
-			return d.request(uri, method, callback, true)
+			return d.requestReturnErrResp(uri, method, callback, true)
 		}
-		return nil, fmt.Errorf("%s:%s", e.Code, e.Message)
+		return nil, fmt.Errorf("%s:%s", e.Code, e.Message), &e
 	}
-	return res.Body(), nil
+	return res.Body(), nil, nil
 }
 
-func (d *AliyundriveOpen) getFiles(fileId string) ([]File, error) {
+func (d *AliyundriveOpen) list(ctx context.Context, data base.Json) (*Files, error) {
+	var resp Files
+	_, err := d.request("/adrive/v1.0/openFile/list", http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data).SetResult(&resp)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (d *AliyundriveOpen) getFiles(ctx context.Context, fileId string) ([]File, error) {
 	marker := "first"
 	res := make([]File, 0)
 	for marker != "" {
 		if marker == "first" {
 			marker = ""
 		}
-		var resp Files
 		data := base.Json{
 			"drive_id":        d.DriveId,
 			"limit":           200,
@@ -95,9 +164,7 @@ func (d *AliyundriveOpen) getFiles(fileId string) ([]File, error) {
 			//"video_thumbnail_width": 480,
 			//"image_thumbnail_width": 480,
 		}
-		_, err := d.request("/adrive/v1.0/openFile/list", http.MethodPost, func(req *resty.Request) {
-			req.SetBody(data).SetResult(&resp)
-		})
+		resp, err := d.limitList(ctx, data)
 		if err != nil {
 			return nil, err
 		}
@@ -105,4 +172,17 @@ func (d *AliyundriveOpen) getFiles(fileId string) ([]File, error) {
 		res = append(res, resp.Items...)
 	}
 	return res, nil
+}
+
+func getNowTime() (time.Time, string) {
+	nowTime := time.Now()
+	nowTimeStr := nowTime.Format("2006-01-02T15:04:05.000Z")
+	return nowTime, nowTimeStr
+}
+
+func (d *AliyundriveOpen) getAccessToken() string {
+	if d.ref != nil {
+		return d.ref.getAccessToken()
+	}
+	return d.AccessToken
 }
