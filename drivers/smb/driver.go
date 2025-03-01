@@ -5,9 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -16,10 +14,10 @@ import (
 )
 
 type SMB struct {
+	lastConnTime int64
 	model.Storage
 	Addition
-	fs           *smb2.Share
-	lastConnTime time.Time
+	fs *smb2.Share
 }
 
 func (d *SMB) Config() driver.Config {
@@ -63,6 +61,7 @@ func (d *SMB) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]m
 				Modified: f.ModTime(),
 				Size:     f.Size(),
 				IsFolder: f.IsDir(),
+				Ctime:    f.(*smb2.FileStat).CreationTime,
 			},
 		}
 		files = append(files, &file)
@@ -81,9 +80,8 @@ func (d *SMB) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*m
 		return nil, err
 	}
 	link := &model.Link{
-		Data: remoteFile,
+		MFile: remoteFile,
 	}
-	base.HandleRange(link, remoteFile, args.Header, file.GetSize())
 	d.updateLastConnTime()
 	return link, nil
 }
@@ -188,7 +186,7 @@ func (d *SMB) Put(ctx context.Context, dstDir model.Obj, stream model.FileStream
 			_ = d.fs.Remove(fullPath)
 		}
 	}()
-	err = utils.CopyWithCtx(ctx, out, stream, stream.GetSize(), up)
+	err = utils.CopyWithCtx(ctx, out, driver.NewLimitedUploadStream(ctx, stream), stream.GetSize(), up)
 	if err != nil {
 		return err
 	}
